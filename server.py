@@ -1,11 +1,11 @@
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from openai import OpenAI
 from dotenv import load_dotenv
 import os
 import uuid
 from typing import Optional
+import httpx
 
 # Load environment variables from .env file (for local dev)
 env_path = os.path.join(os.path.dirname(__file__), ".env")
@@ -29,9 +29,6 @@ if not api_key:
         "OPENAI_API_KEY environment variable is not set. "
         "Please set it in Render Environment or in a local .env file."
     )
-
-# Initialize OpenAI client
-openai_client = OpenAI(api_key=api_key)
 
 WORKFLOW_ID = os.environ.get("CHATKIT_WORKFLOW_ID")
 if not WORKFLOW_ID:
@@ -81,14 +78,44 @@ async def create_chatkit_session(request: Request):
         
         print(f"Creating ChatKit session with workflow_id: {WORKFLOW_ID}, user: {device_id}")
         
-        # Create ChatKit session
-        session = openai_client.chatkit.sessions.create(
-            workflow={"id": WORKFLOW_ID},
-            user=device_id,
-        )
+        # Create ChatKit session using REST API (OpenAI SDK 2.x doesn't have chatkit attribute)
+        headers = {
+            "Content-Type": "application/json",
+            "OpenAI-Beta": "chatkit_beta=v1",
+            "Authorization": f"Bearer {api_key}"
+        }
+        json_data = {
+            "workflow": {"id": WORKFLOW_ID},
+            "user": device_id
+        }
         
-        print(f"Session created successfully: {session.id}")
-        return {"client_secret": session.client_secret}
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://api.openai.com/v1/chatkit/sessions",
+                headers=headers,
+                json=json_data,
+                timeout=30.0
+            )
+            
+            if response.status_code != 200:
+                error_text = response.text
+                print(f"ERROR: OpenAI API returned {response.status_code}: {error_text}")
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail=f"OpenAI API error: {error_text}"
+                )
+            
+            session_data = response.json()
+            session_id = session_data.get("id", "unknown")
+            client_secret = session_data.get("client_secret")
+            
+            if not client_secret:
+                error_msg = "No client_secret in OpenAI API response"
+                print(f"ERROR: {error_msg}")
+                raise HTTPException(status_code=500, detail=error_msg)
+            
+            print(f"Session created successfully: {session_id}")
+            return {"client_secret": client_secret}
     except HTTPException:
         raise
     except Exception as e:
