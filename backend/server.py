@@ -90,7 +90,17 @@ def root():
             "create_session": "/api/chatkit/session (POST)",
         },
     }
+from fastapi import Request
 
+@app.api_route("/api/chatkit/session", methods=["GET", "POST"])
+async def chatkit_session(request: Request):
+    if request.method == "GET":
+        device_id = request.query_params.get("device_id")
+    else:
+        body = await request.json()
+        device_id = body.get("device_id")
+
+    return await _create_chatkit_session_internal(device_id)
 if __name__ == "__main__":
     import uvicorn
     # For local dev only. Render uses the start command you configured.
