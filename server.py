@@ -1,9 +1,12 @@
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import os
 import uuid
+import json
+import time
 from typing import Optional
 import httpx
 
@@ -38,6 +41,8 @@ if not WORKFLOW_ID:
 DOMAIN_PUBLIC_KEY = os.environ.get("CHATKIT_DOMAIN_PUBLIC_KEY")
 if not DOMAIN_PUBLIC_KEY:
     print("WARNING: CHATKIT_DOMAIN_PUBLIC_KEY environment variable is not set. ChatKit may not work on your domain.")
+
+N8N_WEBHOOK = "https://zaaihbg.app.n8n.cloud/webhook/zaai-chat"
 
 class SessionRequest(BaseModel):
     device_id: Optional[str] = None
@@ -122,6 +127,64 @@ async def create_chatkit_session(request: Request):
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error creating ChatKit session: {str(e)}")
+
+@app.post("/chatkit")
+async def chatkit_handler(request: Request):
+    """ChatKit custom backend — routes requests to n8n."""
+    body = await request.json()
+    req_type = body.get("type", "")
+    params = body.get("params", {})
+
+    if req_type == "threads.create":
+        return JSONResponse({
+            "id": f"thread_{int(time.time() * 1000)}",
+            "object": "chatkit.thread",
+            "created_at": int(time.time()),
+            "metadata": {},
+        })
+
+    if req_type == "threads.add_user_message":
+        thread_id = params.get("thread_id", f"thread_{int(time.time() * 1000)}")
+        content_list = params.get("input", {}).get("content", [])
+        user_message = " ".join(
+            c.get("text", "") for c in content_list if c.get("type") == "text"
+        )
+
+        async def stream_response():
+            item_id = f"item_{int(time.time() * 1000)}"
+            reply = "Tyvärr kunde jag inte svara just nu."
+            try:
+                async with httpx.AsyncClient() as client:
+                    resp = await client.post(
+                        N8N_WEBHOOK,
+                        json={"message": user_message, "sessionId": thread_id},
+                        timeout=60.0,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                    reply = (
+                        data.get("response")
+                        or data.get("output")
+                        or data.get("text")
+                        or data.get("message")
+                        or reply
+                    )
+            except Exception as e:
+                print(f"n8n error: {e}")
+
+            events = [
+                {"type": "thread.item.added", "item": {"id": item_id, "type": "message", "role": "assistant", "status": "in_progress", "content": []}},
+                {"type": "thread.item.updated", "item": {"id": item_id, "delta": {"content": [{"type": "output_text", "output_index": 0, "delta": reply}]}}},
+                {"type": "thread.item.done", "item": {"id": item_id, "type": "message", "role": "assistant", "status": "completed", "content": [{"type": "output_text", "text": reply}]}},
+            ]
+            for event in events:
+                yield f"data: {json.dumps(event)}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(stream_response(), media_type="text/event-stream")
+
+    return JSONResponse({})
+
 
 @app.get("/health")
 def health_check():
